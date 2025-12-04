@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.signal import butter, filtfilt, welch
+import matplotlib.pyplot as plt
+from io import StringIO
 
 # ----------------- STREAMLIT CONFIG -----------------
 st.set_page_config(page_title="NeuroEMG-Insight", layout="wide")
@@ -16,7 +18,7 @@ st.write(
     "and activity type."
 )
 
-# ----------------- SIGNAL PROCESSING HELPERS -----------------
+# ----------------- HELPERS -----------------
 def bandpass_filter(signal, low=20, high=450, fs=1000, order=4):
     b, a = butter(order, [low / (fs / 2), high / (fs / 2)], btype="band")
     return filtfilt(b, a, signal)
@@ -39,11 +41,31 @@ def mnf_mdf(signal, fs=1000):
     mnf = np.sum(freqs * psd) / np.sum(psd)
     cumulative = np.cumsum(psd)
     mdf = freqs[np.where(cumulative >= cumulative[-1] / 2)[0][0]]
-    return mnf, mdf
+    return mnf, mdf, freqs, psd
 
-# ----------------- UI: CONTEXT INPUT (MUSCLE + ACTIVITY) -----------------
+def make_example_signal(fs=1000, duration_s=2.0):
+    t = np.linspace(0, duration_s, int(fs * duration_s), endpoint=False)
+    # simple EMG-like noisy burst
+    sig = 0.3 * np.sin(2 * np.pi * 50 * t) + 0.1 * np.random.randn(len(t))
+    return t, sig
+
+# ----------------- SIDEBAR: SAMPLE DATA DOWNLOAD -----------------
+with st.sidebar:
+    st.header("Sample EMG data")
+    t_ex, sig_ex = make_example_signal()
+    df_ex = pd.DataFrame({"emg": sig_ex})
+    csv_buf = StringIO()
+    df_ex.to_csv(csv_buf, index=False)
+    st.download_button(
+        "Download example EMG CSV",
+        data=csv_buf.getvalue(),
+        file_name="example_emg.csv",
+        mime="text/csv",
+    )
+    st.caption("Use this if you just want to try the tool quickly.")
+
+# ----------------- CLINICAL CONTEXT -----------------
 st.markdown("### Clinical Context")
-
 col1, col2 = st.columns(2)
 
 with col1:
@@ -67,7 +89,7 @@ with col2:
 
 st.markdown("---")
 
-# ----------------- UI: INPUT METHOD -----------------
+# ----------------- INPUT METHOD -----------------
 input_method = st.radio(
     "Choose how to provide EMG signal:",
     ["Upload file (CSV / TXT)", "Paste raw EMG values"],
@@ -104,107 +126,141 @@ else:  # Paste raw values
         except ValueError:
             st.error("Could not parse numbers. Check that all entries are numeric.")
 
-# ----------------- PROCESSING & INTERPRETATION -----------------
-MIN_FREQ_LEN = 50   # minimum samples for filtering + frequency features
+# ----------------- MAIN ANALYSIS -----------------
+MIN_FREQ_LEN = 50   # minimum samples for safe freq analysis
 
 if signal is not None:
     n = len(signal)
-    st.write(f"### Raw EMG Signal  —  {n} samples")
-    st.line_chart(signal)
+    st.write(f"Loaded EMG signal with **{n} samples**.")
 
-    # ---- Always compute simple time-domain features ----
-    time_features = {
+    # Precompute time-domain features on raw signal
+    time_feats = {
         "RMS": rms(signal),
         "MAV": mav(signal),
     }
 
     can_do_freq = n >= MIN_FREQ_LEN
+    filtered = None
+    freq_feats = {}
+    freqs = None
+    psd = None
 
-    if not can_do_freq:
-        st.warning(
-            f"Signal length ({n} samples) is too short for safe filtering and "
-            f"frequency-domain analysis (need at least {MIN_FREQ_LEN}). "
-            "Showing only time-domain features."
-        )
-        filtered = None
-    else:
+    if can_do_freq:
         filtered = bandpass_filter(signal, fs=fs)
-        st.write("### Filtered Signal (20–450 Hz Bandpass)")
-        st.line_chart(filtered)
+        mnf_val, mdf_val, freqs, psd = mnf_mdf(filtered, fs=fs)
+        freq_feats = {
+            "MNF (Hz)": mnf_val,
+            "MDF (Hz)": mdf_val,
+            "ZC": zero_crossing(filtered),
+            "WAMP": wamp(filtered),
+        }
 
-    # ---- Feature table ----
-    feature_rows = []
-
-    # Time-domain features (always)
-    feature_rows.append(("RMS", time_features["RMS"]))
-    feature_rows.append(("MAV", time_features["MAV"]))
-
-    freq_features = {}
-    if can_do_freq and filtered is not None:
-        mnf_val, mdf_val = mnf_mdf(filtered, fs=fs)
-        freq_features["MNF (Hz)"] = mnf_val
-        freq_features["MDF (Hz)"] = mdf_val
-        freq_features["ZC"] = zero_crossing(filtered)
-        freq_features["WAMP"] = wamp(filtered)
-
-        for k, v in freq_features.items():
-            feature_rows.append((k, v))
-
-    st.write("### Extracted Features")
-    st.table(pd.DataFrame(feature_rows, columns=["Feature", "Value"]))
-
-    # ---- Interpretation Engine ----
-    st.write("### Interpretation (Prototype)")
-
-    interpretation = []
-
-    # Context info
-    interpretation.append(
-        f"Muscle: **{muscle_name}**, Activity: **{activity_type}**."
+    # ----------------- TABS LAYOUT -----------------
+    tab_time, tab_freq, tab_features = st.tabs(
+        ["Time-domain signals", "Frequency analysis", "Features & interpretation"]
     )
 
-    # Time-domain logic
-    if time_features["RMS"] > 0.9:
-        interpretation.append("High RMS → strong muscle contraction intensity.")
-    elif time_features["RMS"] < 0.3:
-        interpretation.append("Low RMS → weak muscle activation / poor recruitment.")
+    # === TIME TAB ===
+    with tab_time:
+        st.subheader("Raw EMG Signal")
+        st.line_chart(signal)
 
-    if time_features["MAV"] < 0.1:
-        interpretation.append("Very low MAV → overall low EMG amplitude.")
-
-    # Frequency-domain logic (only if we have it)
-    if can_do_freq and filtered is not None:
-        mnf_val = freq_features["MNF (Hz)"]
-        mdf_val = freq_features["MDF (Hz)"]
-
-        if mnf_val < 70 and mdf_val < 75:
-            interpretation.append(
-                "Frequency content shifted to lower band → this pattern is consistent "
-                "with developing muscle fatigue or reduced motor unit firing rate."
+        if filtered is not None:
+            st.subheader("Filtered EMG (20–450 Hz bandpass)")
+            st.line_chart(filtered)
+        else:
+            st.info(
+                f"Signal too short for filtering and frequency analysis "
+                f"(need at least {MIN_FREQ_LEN} samples)."
             )
-        elif mnf_val > 100:
-            interpretation.append(
-                "High mean frequency → strong, fast motor unit firing, typical of "
-                "high-intensity or explosive contractions."
+
+    # === FREQUENCY TAB ===
+    with tab_freq:
+        if can_do_freq and filtered is not None and freqs is not None:
+            st.subheader("Power Spectral Density (Welch)")
+            fig_psd, ax_psd = plt.subplots()
+            ax_psd.semilogy(freqs, psd)
+            ax_psd.set_xlabel("Frequency (Hz)")
+            ax_psd.set_ylabel("PSD (power / Hz)")
+            ax_psd.set_title("EMG Power Spectrum")
+            st.pyplot(fig_psd)
+
+            # Simple FFT magnitude
+            st.subheader("FFT Magnitude")
+            freqs_fft = np.fft.rfftfreq(len(filtered), d=1.0/fs)
+            fft_mag = np.abs(np.fft.rfft(filtered))
+            fig_fft, ax_fft = plt.subplots()
+            ax_fft.plot(freqs_fft, fft_mag)
+            ax_fft.set_xlabel("Frequency (Hz)")
+            ax_fft.set_ylabel("Magnitude")
+            ax_fft.set_title("FFT of EMG signal")
+            st.pyplot(fig_fft)
+        else:
+            st.warning(
+                f"Frequency domain analysis not available because signal length "
+                f"is < {MIN_FREQ_LEN} samples."
             )
-    else:
+
+    # === FEATURES & INTERPRETATION TAB ===
+    with tab_features:
+        st.subheader("Extracted Features")
+
+        rows = [("RMS", time_feats["RMS"]), ("MAV", time_feats["MAV"])]
+        for k, v in freq_feats.items():
+            rows.append((k, v))
+
+        st.table(pd.DataFrame(rows, columns=["Feature", "Value"]))
+
+        st.subheader("Interpretation (Prototype)")
+        interpretation = []
+
+        # Context line
         interpretation.append(
-            "Frequency-based features (MNF, MDF, ZC, WAMP) not computed because the "
-            f"signal was too short (< {MIN_FREQ_LEN} samples). For full analysis, "
-            "record a longer EMG segment."
+            f"Muscle: **{muscle_name}**, Activity: **{activity_type}**."
         )
 
-    # Activity-specific note (simple version)
-    if "Fatigue" in activity_type and can_do_freq and filtered is not None:
-        interpretation.append(
-            "Since this is a fatigue protocol, monitor MNF/MDF decrease over time to "
-            "quantify fatigue progression in this muscle."
-        )
-    elif "Rest" in activity_type:
-        interpretation.append(
-            "During rest, EMG activity should be minimal. Elevated RMS/MAV at rest "
-            "may indicate noise, poor electrode placement, or involuntary activation."
-        )
+        # Time-domain logic
+        if time_feats["RMS"] > 0.9:
+            interpretation.append("High RMS → strong muscle contraction intensity.")
+        elif time_feats["RMS"] < 0.3:
+            interpretation.append("Low RMS → weak muscle activation / poor recruitment.")
 
-    for line in interpretation:
-        st.markdown(f"- {line}")
+        if time_feats["MAV"] < 0.1:
+            interpretation.append("Very low MAV → overall low EMG amplitude.")
+
+        # Frequency-domain logic
+        if can_do_freq and filtered is not None:
+            mnf_val = freq_feats["MNF (Hz)"]
+            mdf_val = freq_feats["MDF (Hz)"]
+            if mnf_val < 70 and mdf_val < 75:
+                interpretation.append(
+                    "Frequency content shifted to lower band → pattern consistent "
+                    "with developing muscle fatigue or reduced motor unit firing rate."
+                )
+            elif mnf_val > 100:
+                interpretation.append(
+                    "High mean frequency → strong, fast motor unit firing, typical "
+                    "of high-intensity or explosive contractions."
+                )
+        else:
+            interpretation.append(
+                f"Frequency-based features (MNF, MDF, ZC, WAMP) not computed because "
+                f"the signal was too short (< {MIN_FREQ_LEN} samples)."
+            )
+
+        # Activity-specific hints
+        if "Fatigue" in activity_type and can_do_freq and filtered is not None:
+            interpretation.append(
+                "For fatigue protocols, track MNF/MDF decrease across repetitions "
+                "to quantify fatigue progression for this muscle."
+            )
+        elif "Rest" in activity_type:
+            interpretation.append(
+                "During rest, EMG should be near baseline. Elevated RMS/MAV at rest "
+                "may indicate noise, poor electrode placement, or involuntary activity."
+            )
+
+        for line in interpretation:
+            st.markdown(f"- {line}")
+else:
+    st.info("Upload or paste an EMG signal to begin analysis.")
